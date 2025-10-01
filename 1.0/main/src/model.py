@@ -40,39 +40,66 @@ HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
 if 'x070' in os.environ["RWKV_MY_TESTING"]:
     CHUNK_LEN = 16
 
+    # 修改现有的函数，添加对 fused_state 的支持
     flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
     load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
 
     class WindBackstepping(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, w,q,k,v,z,b):
-            B,T,H,C = w.shape 
-            assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
-            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
-            assert all(i.is_contiguous() for i in [w,q,k,v,z,b])
+        def forward(ctx, w, q, k, v, z, b, fused_state=None):
+            B, T, H, C = w.shape 
+            assert T % CHUNK_LEN == 0
+        
+            # 处理 fused_state
+            if fused_state is not None:
+                assert fused_state.shape == (B, H, C)
+                assert fused_state.dtype == torch.bfloat16
+                assert fused_state.is_contiguous()
+            else:
+                # 如果没有提供 fused_state，创建一个零状态
+                fused_state = torch.zeros(B, H, C, dtype=torch.bfloat16, device=w.device)
+        
             y = torch.empty_like(v)
-            s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)
-            sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)
-            torch.ops.wind_backstepping.forward(w,q,k,v,z,b, y,s,sa)
-            ctx.save_for_backward(w,q,k,v,z,b,s,sa)
+            s = torch.empty(B, H, T // CHUNK_LEN, C, C, dtype=torch.float32, device=w.device)
+            sa = torch.empty(B, T, H, C, dtype=torch.float32, device=w.device)
+        
+            # 调用修改后的 CUDA 内核，传入 fused_state
+            torch.ops.wind_backstepping.forward_with_state(w, q, k, v, z, b, fused_state, y, s, sa)
+        
+            ctx.save_for_backward(w, q, k, v, z, b, fused_state, s, sa)
             return y
+
         @staticmethod
         def backward(ctx, dy):
-            assert all(i.dtype==torch.bfloat16 for i in [dy])
-            assert all(i.is_contiguous() for i in [dy])
-            w,q,k,v,z,b,s,sa = ctx.saved_tensors
-            dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]
-            torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)
-            return dw,dq,dk,dv,dz,db
+            w, q, k, v, z, b, fused_state, s, sa = ctx.saved_tensors
+            dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
+            dfused_state = torch.empty_like(fused_state) if fused_state is not None else None
 
-    def RUN_CUDA_RWKV7g(q,w,k,v,a,b):
+            torch.ops.wind_backstepping.backward_with_state(
+                w, q, k, v, z, b, fused_state, dy, s, sa, 
+                dw, dq, dk, dv, dz, db, dfused_state
+            )
+            return dw, dq, dk, dv, dz, db, dfused_state
+
+    def RUN_CUDA_RWN(q, w, k, v, a, b, fused_state=None):
+        B, T, HC = q.shape
+        q, w, k, v, a, b = [i.view(B, T, HC // 64, 64) for i in [q, w, k, v, a, b]]
+    
+        # 如果提供了 fused_state，需要将其 reshape 为 [B, H, C]
+        if fused_state is not None:
+            fused_state = fused_state.view(B, HC // 64, 64)
+    
+        return WindBackstepping.apply(w, q, k, v, a, b, fused_state).view(B, T, HC)
+
+    # 保持向后兼容的原始函数
+    def RUN_CUDA_RWKV7g_original(q, w, k, v, a, b):
         B,T,HC = q.shape
         q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
         return WindBackstepping.apply(w,q,k,v,a,b).view(B,T,HC)
 
 ########################################################################################################
 
-class RWKV_Tmix_x070(MyModule):
+class RNW_Tmix(MyModule):
     def __init__(self, args, layer_id):
         super().__init__()
         self.args = args
@@ -85,6 +112,24 @@ class RWKV_Tmix_x070(MyModule):
         H = self.n_head
         N = self.head_size
         C = args.n_embd
+
+        # ==================== RunningWay State Gate ====================
+        # 门控网络：决定三个state的融合权重 [gate_rnn, gate_win, gate_sys]
+        self.state_gate_net = nn.Sequential(
+            nn.Linear(C, max(32, C // 4)),  # 轻量MLP
+            nn.SiLU(),
+            nn.Linear(max(32, C // 4), 3),  # 输出3个权重
+            nn.Softmax(dim=-1)
+        )
+        
+        # 初始化默认权重 [0.3, 0.4, 0.3] - 方便调试
+        with torch.no_grad():
+            self.state_gate_net[2].weight.data.zero_()
+            self.state_gate_net[2].bias.data.copy_(torch.tensor([0.3, 0.4, 0.3]))
+        
+        # Window state 相关参数
+        self.window_size = getattr(args, 'window_size', 1024)  # 滑动窗口大小
+        # ==================== End RunningWay Additions ====================
 
         with torch.no_grad():
             ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
@@ -160,9 +205,45 @@ class RWKV_Tmix_x070(MyModule):
             self.output.weight.data.zero_()
 
     @MyFunction
-    def forward(self, x, v_first):
+    def forward(self, x, v_first, state_pool=None, layer_id=0):
+        """
+        RunningWay Modified Forward with Triple-State Fusion
+        
+        Args:
+            x: input tensor [B, T, C]
+            v_first: v of first layer (for value residual)
+            state_pool: StateMemoryPool instance providing three states
+            layer_id: current layer index
+        """
         B, T, C = x.size()
         H = self.n_head
+        
+        # ==================== RunningWay State Fusion ====================
+        # 如果没有提供state_pool，fallback到原始行为
+        if state_pool is None:
+            return self._original_forward(x, v_first)
+        
+        # 获取三个state
+        rnn_state, win_state, sys_state = state_pool.get_state_slices(layer_id)
+        
+        # 计算门控权重 [gate_rnn, gate_win, gate_sys]
+        # 使用当前token的均值作为门控输入
+        x_mean = x.mean(dim=1, keepdim=True)  # [B, 1, C]
+        gate_weights = self.state_gate_net(x_mean.squeeze(1))  # [B, 3]
+        gate_rnn, gate_win, gate_sys = gate_weights[:, 0], gate_weights[:, 1], gate_weights[:, 2]
+        
+        # 扩展门控权重以匹配state维度
+        gate_rnn = gate_rnn.unsqueeze(-1)  # [B, 1]
+        gate_win = gate_win.unsqueeze(-1)
+        gate_sys = gate_sys.unsqueeze(-1)
+        
+        # 融合三个state
+        fused_state = gate_rnn * rnn_state.unsqueeze(0)  # [B, rnn_dim]
+        fused_state = fused_state + gate_win * win_state.unsqueeze(0)
+        if sys_state is not None:
+            fused_state = fused_state + gate_sys * sys_state.unsqueeze(0)
+        # ==================== End State Fusion ====================
+
         xx = self.time_shift(x) - x
 
         xr = x + xx * self.x_r
@@ -181,6 +262,74 @@ class RWKV_Tmix_x070(MyModule):
         else:
             v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2) # add value residual
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2) # a is "in-context learning rate"
+        g = torch.sigmoid(xg @ self.g1) @ self.g2
+
+        kk = k * self.k_k
+        kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
+        k = k * (1 + (a-1) * self.k_a)
+
+        # ==================== RunningWay WKV with Fused State ====================
+        # 使用融合后的state进行WKV计算
+        # 注意：这里需要修改RUN_CUDA_RWKV7g以接受fused_state
+        # 暂时使用原始调用，实际需要修改CUDA内核
+        x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk*a)
+        # ==================== End RunningWay WKV ====================
+
+        x = self.ln_x(x.view(B * T, C)).view(B, T, C)
+
+        x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+        x = self.output(x * g)
+        
+        # ==================== RunningWay State Update ====================
+        # 更新RNN state (使用衰减机制)
+        # 这里需要根据WKV计算的结果更新state_pool中的rnn_state和win_state
+        # 注意：这是一个简化的更新，实际需要更精细的设计
+        if state_pool is not None:
+            # 计算新的state更新（这里需要根据WKV内部逻辑）
+            # 简化版本：使用k和v的某种组合作为state更新
+            with torch.no_grad():
+                # 取最后一个token的state作为更新
+                last_k = k[:, -1, :]  # [B, C]
+                last_v = v[:, -1, :]  # [B, C]
+                
+                # RNN state更新（使用衰减）
+                new_rnn_state = rnn_state.unsqueeze(0) * 0.9 + last_k * last_v * 0.1
+                new_rnn_state = new_rnn_state.mean(dim=0)  # 平均batch维度
+                
+                # Window state更新（滑动窗口机制）
+                # 这里需要维护一个固定大小的窗口缓存
+                # 简化版本：直接更新
+                new_win_state = win_state.unsqueeze(0) * 0.8 + last_k * last_v * 0.2
+                new_win_state = new_win_state.mean(dim=0)
+                
+                # 更新state_pool
+                state_pool.update_state_pool(layer_id, new_rnn_state, new_win_state)
+        # ==================== End State Update ====================
+        
+        return x, v_first
+
+    def _original_forward(self, x, v_first):
+        """Fallback to original RWKV-7 forward when state_pool is not provided"""
+        B, T, C = x.size()
+        H = self.n_head
+        xx = self.time_shift(x) - x
+
+        xr = x + xx * self.x_r
+        xw = x + xx * self.x_w
+        xk = x + xx * self.x_k
+        xv = x + xx * self.x_v
+        xa = x + xx * self.x_a
+        xg = x + xx * self.x_g
+
+        r = self.receptance(xr)
+        w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5
+        k = self.key(xk)
+        v = self.value(xv)
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+        a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
         g = torch.sigmoid(xg @ self.g1) @ self.g2
 
         kk = k * self.k_k
@@ -242,7 +391,7 @@ class Block(nn.Module):
         if self.layer_id == 0:
             self.ln0 = nn.LayerNorm(args.n_embd)
 
-        self.att = RWKV_Tmix_x070(args, layer_id)
+        self.att = RNW_Tmix(args, layer_id)
         self.ffn = RWKV_CMix_x070(args, layer_id)
         
     def forward(self, x, v_first):
