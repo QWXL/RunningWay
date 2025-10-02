@@ -1,5 +1,6 @@
 ########################################################################################################
-# The RWKV Language Model - https://github.com/BlinkDL/RWKV-LM
+# RunningWay Large Language Model
+# Github: https://github.com/QWXL/RunningWay
 ########################################################################################################
 
 import os, math, gc, importlib
@@ -12,11 +13,14 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
+from typing import Optional
+from main.rnw.runningway_config import RunningWayConfig
+from main.rnw.state_pool import StateMemoryPool
 
 try:
-    print('RWKV_MY_TESTING', os.environ["RWKV_MY_TESTING"])
+    print('RNW_MY_TESTING', os.environ["RNW_MY_TESTING"])
 except:
-    os.environ["RWKV_MY_TESTING"] = ''
+    os.environ["RNW_MY_TESTING"] = ''
 
 def __nop(ob):
     return ob
@@ -24,7 +28,7 @@ def __nop(ob):
 
 MyModule = nn.Module
 MyFunction = __nop
-if os.environ["RWKV_JIT_ON"] == "1":
+if os.environ["RNW_JIT_ON"] == "1":
     MyModule = torch.jit.ScriptModule
     MyFunction = torch.jit.script_method
 
@@ -35,20 +39,22 @@ if os.environ["RWKV_JIT_ON"] == "1":
 
 from torch.utils.cpp_extension import load
 
-HEAD_SIZE = int(os.environ["RWKV_HEAD_SIZE"])
+HEAD_SIZE = int(os.environ["RNW_HEAD_SIZE"])
 
-if 'x070' in os.environ["RWKV_MY_TESTING"]:
+if 'r010' in os.environ["RNW_MY_TESTING"]:
     CHUNK_LEN = 16
 
     # 修改现有的函数，添加对 fused_state 的支持
     flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
     load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+    print(f"[RNW] Successfully loaded wind_backstepping kernel with HEAD_SIZE={HEAD_SIZE}, CHUNK_LEN={CHUNK_LEN}")
 
 
     class WindBackstepping_original(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w,q,k,v,z,b):
             B,T,H,C = w.shape 
+            print(f"[WindBackstepping_original] Forward: B={B}, T={T}, H={H}, C={C}")
             assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
             assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
             assert all(i.is_contiguous() for i in [w,q,k,v,z,b])
@@ -57,14 +63,17 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
             sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)
             torch.ops.wind_backstepping.forward(w,q,k,v,z,b, y,s,sa)
             ctx.save_for_backward(w,q,k,v,z,b,s,sa)
+            print(f"[WindBackstepping_original] Forward completed")
             return y
         @staticmethod
         def backward(ctx, dy):
+            print(f"[WindBackstepping_original] Backward started")
             assert all(i.dtype==torch.bfloat16 for i in [dy])
             assert all(i.is_contiguous() for i in [dy])
             w,q,k,v,z,b,s,sa = ctx.saved_tensors
             dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]
             torch.ops.wind_backstepping.backward(w,q,k,v,z,b, dy,s,sa, dw,dq,dk,dv,dz,db)
+            print(f"[WindBackstepping_original] Backward completed")
             return dw,dq,dk,dv,dz,db
 
 
@@ -72,16 +81,18 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         @staticmethod
         def forward(ctx, w, q, k, v, z, b, fused_state=None):
             B, T, H, C = w.shape 
+            print(f"[WindBackstepping] Forward: B={B}, T={T}, H={H}, C={C}")
             assert T % CHUNK_LEN == 0
         
             # 处理 fused_state
             if fused_state is not None:
                 assert fused_state.shape == (B, H, C)
-                assert fused_state.dtype == torch.bfloat16
                 assert fused_state.is_contiguous()
+                print(f"[WindBackstepping] Using provided fused_state with shape {fused_state.shape}")
             else:
                 # 如果没有提供 fused_state，创建一个零状态
-                fused_state = torch.zeros(B, H, C, dtype=torch.bfloat16, device=w.device)
+                fused_state = torch.zeros(B, H, C, dtype=torch.float32, device=w.device)
+                print(f"[WindBackstepping] Created zero fused_state with shape {fused_state.shape}")
         
             y = torch.empty_like(v)
             s = torch.empty(B, H, T // CHUNK_LEN, C, C, dtype=torch.float32, device=w.device)
@@ -91,10 +102,12 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
             torch.ops.wind_backstepping.forward_with_state(w, q, k, v, z, b, fused_state, y, s, sa)
         
             ctx.save_for_backward(w, q, k, v, z, b, fused_state, s, sa)
+            print(f"[WindBackstepping] Forward completed")
             return y
 
         @staticmethod
         def backward(ctx, dy):
+            print(f"[WindBackstepping] Backward started")
             w, q, k, v, z, b, fused_state, s, sa = ctx.saved_tensors
             dw, dq, dk, dv, dz, db = [torch.empty_like(x) for x in [w, q, k, v, z, b]]
             dfused_state = torch.empty_like(fused_state) if fused_state is not None else None
@@ -103,10 +116,12 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
                 w, q, k, v, z, b, fused_state, dy, s, sa, 
                 dw, dq, dk, dv, dz, db, dfused_state
             )
+            print(f"[WindBackstepping] Backward completed")
             return dw, dq, dk, dv, dz, db, dfused_state
 
     USE_MULTI_STATE = True  # 设置为 False 可回退到原始行为
     USE_NEW_CUDA_KERNEL = False  # 初始为 False，等待新内核就绪
+    print(f"[RNW] USE_MULTI_STATE={USE_MULTI_STATE}, USE_NEW_CUDA_KERNEL={USE_NEW_CUDA_KERNEL}")
 
     # 兼容性包装器
     def RUN_CUDA_RWKV7g_compatible(q, w, k, v, a, b, fused_state=None, state_gate_weights=None):
@@ -115,18 +130,26 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         """
         B, T, HC = q.shape
         H = HC // 64
+        print(f"[RUN_CUDA_RWKV7g_compatible] Input shapes: q={q.shape}, w={w.shape}, k={k.shape}, v={v.shape}, a={a.shape}, b={b.shape}")
+        if fused_state is not None:
+            print(f"[RUN_CUDA_RWKV7g_compatible] fused_state shape: {fused_state.shape}")
         
         # 如果不使用多状态，直接调用原始函数
         if not USE_MULTI_STATE or fused_state is None:
+            print(f"[RUN_CUDA_RWKV7g_compatible] Using original function (USE_MULTI_STATE={USE_MULTI_STATE}, fused_state is None={fused_state is None})")
             return RUN_CUDA_RWKV7g_original(q, w, k, v, a, b)
         
         # 如果新 CUDA 内核可用，使用新内核
         if USE_NEW_CUDA_KERNEL and hasattr(torch.ops.wind_backstepping, 'forward_with_state'):
+            print(f"[RUN_CUDA_RWKV7g_compatible] Using new CUDA kernel")
             q, w, k, v, a, b = [i.view(B, T, H, 64) for i in [q, w, k, v, a, b]]
             fused_state_reshaped = fused_state.view(B, H, 64)
-            return WindBackstepping.apply(w, q, k, v, a, b, fused_state_reshaped).view(B, T, HC)
+            result = WindBackstepping.apply(w, q, k, v, a, b, fused_state_reshaped).view(B, T, HC)
+            print(f"[RUN_CUDA_RWKV7g_compatible] New CUDA kernel completed")
+            return result
         
         # 否则，使用 Python 模拟的多状态融合（训练时可用，推理时较慢）
+        print(f"[RUN_CUDA_RWKV7g_compatible] Using fallback implementation")
         return _run_multi_state_fallback(q, w, k, v, a, b, fused_state, state_gate_weights)
 
     def _run_multi_state_fallback(q, w, k, v, a, b, fused_state, state_gate_weights):
@@ -136,15 +159,19 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
         """
         B, T, HC = q.shape
         H = HC // 64
+        print(f"[_run_multi_state_fallback] Input shapes: q={q.shape}, w={w.shape}, k={k.shape}, v={v.shape}, a={a.shape}, b={b.shape}")
         
         # 将 fused_state 分解为三个状态分量
         if state_gate_weights is not None:
             gate_rnn, gate_win, gate_sys = state_gate_weights
+            print(f"[_run_multi_state_fallback] Using provided state_gate_weights: rnn={gate_rnn}, win={gate_win}, sys={gate_sys}")
         else:
             gate_rnn, gate_win, gate_sys = 0.33, 0.34, 0.33
+            print(f"[_run_multi_state_fallback] Using default state_gate_weights: rnn={gate_rnn}, win={gate_win}, sys={gate_sys}")
         
         # 使用原始 WKV 计算主输出
         main_output = RUN_CUDA_RWKV7g_original(q, w, k, v, a, b)
+        print(f"[_run_multi_state_fallback] Original WKV computation completed")
         
         # 模拟状态融合的影响（简化版本）
         # 在实际应用中，这应该更精细地模拟三个状态的影响
@@ -165,31 +192,42 @@ if 'x070' in os.environ["RWKV_MY_TESTING"]:
                 fused_effect += sys_effect.expand(-1, T, -1) * 0.05
             
             main_output = main_output + fused_effect
+            print(f"[_run_multi_state_fallback] Applied fused state effect")
         
+        print(f"[_run_multi_state_fallback] Completed")
         return main_output
 
 
     # 保持向后兼容的原始函数
     def RUN_CUDA_RWKV7g_original(q, w, k, v, a, b):
         B,T,HC = q.shape
+        print(f"[RUN_CUDA_RWKV7g_original] Input shape: q={q.shape}, w={w.shape}, k={k.shape}, v={v.shape}, a={a.shape}, b={b.shape}")
         q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
-        return WindBackstepping_original.apply(w,q,k,v,a,b).view(B,T,HC)
+        result = WindBackstepping_original.apply(w,q,k,v,a,b).view(B,T,HC)
+        print(f"[RUN_CUDA_RWKV7g_original] Completed")
+        return result
 
 ########################################################################################################
 
-class RNW_Tmix(MyModule):
-    def __init__(self, args, layer_id):
-        super().__init__()
-        self.args = args
-        self.layer_id = layer_id
-        self.my_testing = args.my_testing
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from .config import RunningWayConfig
 
-        self.head_size = args.head_size
-        self.n_head = args.dim_att // self.head_size
-        assert args.dim_att % self.n_head == 0
+class RNW_Tmix(MyModule):
+    def __init__(self, config: RunningWayConfig, layer_id: int):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        self.my_testing = config.my_testing
+
+        self.head_size = config.head_size
+        self.n_head = config.dim_att // self.head_size
+        assert config.dim_att % self.n_head == 0
         H = self.n_head
         N = self.head_size
-        C = args.n_embd
+        C = config.n_embd
 
         # ==================== RunningWay State Gate ====================
         # 门控网络：决定三个state的融合权重 [gate_rnn, gate_win, gate_sys]
@@ -200,18 +238,26 @@ class RNW_Tmix(MyModule):
             nn.Softmax(dim=-1)
         )
         
-        # 初始化默认权重 [0.3, 0.4, 0.3] - 方便调试
+        # 状态投影层，将融合状态转换为偏置
+        self.state_proj = nn.Linear(C, C, bias=False)
+        
+        # 初始化默认权重 - 从配置获取
+        default_ratios = config.default_state_ratios
         with torch.no_grad():
             self.state_gate_net[2].weight.data.zero_()
-            self.state_gate_net[2].bias.data.copy_(torch.tensor([0.3, 0.4, 0.3]))
+            self.state_gate_net[2].bias.data.copy_(
+                torch.tensor([default_ratios['rnn'], default_ratios['window'], default_ratios['system']])
+            )
+            # 状态投影层使用小权重初始化
+            nn.init.orthogonal_(self.state_proj.weight, gain=0.1)
         
-        # Window state 相关参数
-        self.window_size = getattr(args, 'window_size', 1024)  # 滑动窗口大小
+        # Window state 相关参数 - 从配置获取
+        self.window_size = config.window_size
         # ==================== End RunningWay Additions ====================
 
         with torch.no_grad():
-            ratio_0_to_1 = layer_id / (args.n_layer - 1)  # 0 to 1
-            ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
+            ratio_0_to_1 = layer_id / (config.n_layer - 1)  # 0 to 1
+            ratio_1_to_almost0 = 1.0 - (layer_id / config.n_layer)  # 1 to ~0
             ddd = torch.ones(1, 1, C)
             for i in range(C):
                 ddd[0, 0, i] = i / C
@@ -288,27 +334,35 @@ class RNW_Tmix(MyModule):
         H = self.n_head
         
         # ==================== RunningWay State Fusion ====================
-        if state_pool is None:
-            return self._original_forward(x, v_first)
+        use_state_fusion = state_pool is not None and hasattr(state_pool, 'get_state_slices')
         
-        # 获取三个state
-        rnn_state, win_state, sys_state = state_pool.get_state_slices(layer_id)
-        
-        # 计算门控权重
-        x_mean = x.mean(dim=1, keepdim=True)
-        gate_weights = self.state_gate_net(x_mean.squeeze(1))
-        gate_rnn, gate_win, gate_sys = gate_weights[:, 0], gate_weights[:, 1], gate_weights[:, 2]
-        
-        # 扩展门控权重
-        gate_rnn = gate_rnn.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
-        gate_win = gate_win.unsqueeze(-1).unsqueeze(-1)
-        gate_sys = gate_sys.unsqueeze(-1).unsqueeze(-1)
-        
-        # 融合三个state [B, H, C]
-        fused_state = gate_rnn * rnn_state.view(B, H, -1)
-        fused_state = fused_state + gate_win * win_state.view(B, H, -1)
-        if sys_state is not None:
-            fused_state = fused_state + gate_sys * sys_state.view(B, H, -1)
+        if use_state_fusion:
+            # 获取三个state
+            rnn_state, win_state, sys_state = state_pool.get_state_slices(layer_id)
+            
+            # 计算门控权重
+            x_mean = x.mean(dim=1)  # [B, C]
+            gate_weights = self.state_gate_net(x_mean)  # [B, 3]
+            gate_rnn, gate_win, gate_sys = gate_weights[:, 0], gate_weights[:, 1], gate_weights[:, 2]
+            
+            # 扩展门控权重用于广播
+            gate_rnn = gate_rnn.view(B, 1, 1)  # [B, 1, 1]
+            gate_win = gate_win.view(B, 1, 1)
+            gate_sys = gate_sys.view(B, 1, 1)
+            
+            # 融合三个state [B, H, head_size]
+            fused_state = gate_rnn * rnn_state.unsqueeze(0)  # 广播到batch维度
+            fused_state = fused_state + gate_win * win_state.unsqueeze(0)
+            
+            if sys_state is not None:
+                fused_state = fused_state + gate_sys * sys_state.unsqueeze(0)
+            
+            # 将融合状态展平并投影为偏置项 [B, 1, C]
+            fused_state_flat = fused_state.reshape(B, C)  # [B, C]
+            state_bias = self.state_proj(fused_state_flat).unsqueeze(1)  # [B, 1, C]
+        else:
+            state_bias = 0.0
+            fused_state = None
         # ==================== End State Fusion ====================
 
         xx = self.time_shift(x) - x
@@ -324,10 +378,18 @@ class RNW_Tmix(MyModule):
         w = -F.softplus(-(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)) - 0.5
         k = self.key(xk)
         v = self.value(xv)
+        
+        # 处理 v_first
         if self.layer_id == 0:
             v_first = v
         else:
-            v = v + (v_first - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+            # 简化处理 v_first
+            if hasattr(self, 'v_first') and self.v_first is not None:
+                v_first_current = self.v_first
+            else:
+                v_first_current = v
+            v = v + (v_first_current - v) * torch.sigmoid(self.v0 + (xv @ self.v1) @ self.v2)
+        
         a = torch.sigmoid(self.a0 + (xa @ self.a1) @ self.a2)
         g = torch.sigmoid(xg @ self.g1) @ self.g2
 
@@ -335,13 +397,13 @@ class RNW_Tmix(MyModule):
         kk = F.normalize(kk.view(B, T, H, -1), dim=-1, p=2.0).view(B, T, C)
         k = k * (1 + (a - 1) * self.k_a)
 
-        # ==================== 使用新的 fused_state ====================
-        # 将 fused_state 转换为正确的数据类型
-        fused_state_bf16 = fused_state.to(torch.bfloat16)
+        # ==================== WKV 计算与状态偏置 ====================
+        # 使用兼容性包装器进行 WKV 计算
+        x = RUN_CUDA_RWKV7g_compatible(r, w, k, v, -kk, kk * a)
         
-        # 调用支持 fused_state 的 WKV 计算
-        x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk * a, fused_state_bf16)
-        # ==================== End RunningWay WKV ====================
+        # 应用状态偏置
+        x = x + state_bias
+        # ==================== End WKV Computation ====================
 
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
@@ -349,32 +411,32 @@ class RNW_Tmix(MyModule):
         x = self.output(x * g)
         
         # ==================== RunningWay State Update ====================
-        if state_pool is not None:
+        if use_state_fusion:
             with torch.no_grad():
-                # 计算新的 state 更新
-                last_k = k[:, -1, :]  # [B, C]
-                last_v = v[:, -1, :]  # [B, C]
-                last_r = r[:, -1, :]  # [B, C]
+                # 从当前计算中计算状态更新
+                # 使用最后一个token的信息进行状态更新
+                last_k = k[:, -1, :].view(B, H, -1)  # [B, H, head_size]
+                last_v = v[:, -1, :].view(B, H, -1)  # [B, H, head_size]
+                last_r = r[:, -1, :].view(B, H, -1)  # [B, H, head_size]
                 
-                # 使用 WKV 输出和输入计算 state 更新
+                # 计算状态更新（简化版）
                 state_update = last_k * last_v * last_r
                 
-                # RNN state 更新（衰减机制）
-                new_rnn_state = rnn_state * 0.9 + state_update.view(B, H, -1).mean(dim=0) * 0.1
-                new_rnn_state = new_rnn_state.mean(dim=0)  # 平均 batch 维度
+                # 使用衰减更新 RNN 状态
+                state_pool.update_rnn_state(layer_id, state_update.mean(dim=0), decay=0.9)
                 
-                # Window state 更新
-                new_win_state = win_state * 0.8 + state_update.view(B, H, -1).mean(dim=0) * 0.2
-                new_win_state = new_win_state.mean(dim=0)
-                
-                # 更新 state_pool
-                state_pool.update_state_pool(layer_id, new_rnn_state, new_win_state)
+                # 更新窗口状态
+                state_pool.update_window_state(layer_id, state_update.mean(dim=0))
         # ==================== End State Update ====================
         
+        # 存储 v_first 供下一层使用
+        if self.layer_id == 0:
+            self.v_first = v_first
+            
         return x, v_first
 
     def _original_forward(self, x, v_first):
-        """Fallback to original RWKV-7 forward when state_pool is not provided"""
+        """回退到原始 RWKV-7 forward，当没有提供 state_pool 时"""
         B, T, C = x.size()
         H = self.n_head
         xx = self.time_shift(x) - x
@@ -401,12 +463,13 @@ class RNW_Tmix(MyModule):
         kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
         k = k * (1 + (a-1) * self.k_a)
 
-        x = RUN_CUDA_RWKV7g(r, w, k, v, -kk, kk*a)
+        x = RUN_CUDA_RWKV7g_compatible(r, w, k, v, -kk, kk*a)
         x = self.ln_x(x.view(B * T, C)).view(B, T, C)
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.r_k).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         x = self.output(x * g)
         return x, v_first
+
     
 ########################################################################################################
 
@@ -441,33 +504,42 @@ class RWKV_CMix_x070(MyModule):
 
 
 ########################################################################################################
-# The RWKV Model with our blocks
+# RunningWay Block (From RWKV Reconstruction)
 ########################################################################################################
 
+import torch
+import torch.nn as nn
+from main.rnw.runningway_config import RunningWayConfig
+
 class Block(nn.Module):
-    def __init__(self, args, layer_id):
+    def __init__(self, config: RunningWayConfig, layer_id: int):
         super().__init__()
-        self.args = args
+        self.config = config
         self.layer_id = layer_id
 
-        self.ln1 = nn.LayerNorm(args.n_embd)
-        self.ln2 = nn.LayerNorm(args.n_embd)
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
 
         if self.layer_id == 0:
-            self.ln0 = nn.LayerNorm(args.n_embd)
+            self.ln0 = nn.LayerNorm(config.n_embd)
 
-        self.att = RNW_Tmix(args, layer_id)
-        self.ffn = RWKV_CMix_x070(args, layer_id)
+        self.att = RNW_Tmix(config, layer_id)
+        self.ffn = RWKV_CMix_x070(config, layer_id)
         
-    def forward(self, x, v_first):
+    def forward(self, x, v_first, state_pool=None, layer_id=0):
+        """
+        Modified forward to support StateMemoryPool
+        """
         if self.layer_id == 0:
             x = self.ln0(x)
 
-        x_attn, v_first = self.att(self.ln1(x), v_first)
+        # Pass state_pool and layer_id to attention
+        x_attn, v_first = self.att(self.ln1(x), v_first, state_pool, layer_id)
         x = x + x_attn
 
         x = x + self.ffn(self.ln2(x))
         return x, v_first
+
 
 
 class L2Wrap(torch.autograd.Function):
@@ -487,27 +559,90 @@ class L2Wrap(torch.autograd.Function):
         return (grad_output, gy)
 
 
-class RWKV(pl.LightningModule):
-    def __init__(self, args):
+
+class RunningWay(pl.LightningModule):
+    def __init__(self, config: RunningWayConfig):
         super().__init__()
-        self.args = args
-        if not hasattr(args, 'dim_att'):
-            args.dim_att = args.n_embd
-        if not hasattr(args, 'dim_ffn'):
-            args.dim_ffn = int((args.n_embd * 3.5) // 32 * 32) # default = 3.5x emb size            
-        assert args.n_embd % 32 == 0
-        assert args.dim_att % 32 == 0
-        assert args.dim_ffn % 32 == 0
+        self.config = config
+        self.save_hyperparameters(ignore=['config'])  # 保存配置到 checkpoint
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        # 自动设置默认值（保持与原始代码兼容）
+        if not hasattr(config, 'dim_att'):
+            config.dim_att = config.n_embd
+        if not hasattr(config, 'dim_ffn'):
+            config.dim_ffn = int((config.n_embd * 3.5) // 32 * 32)
+            
+        assert config.n_embd % 32 == 0
+        assert config.dim_att % 32 == 0
+        assert config.dim_ffn % 32 == 0
 
-        self.emb = nn.Embedding(args.vocab_size, args.n_embd)
+        self.emb = nn.Embedding(config.vocab_size, config.n_embd)
 
-        self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
+        self.blocks = nn.ModuleList([Block(config, i) for i in range(config.n_layer)])
 
-        self.ln_out = nn.LayerNorm(args.n_embd)
-        self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+        self.ln_out = nn.LayerNorm(config.n_embd)
+        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # ==================== RunningWay Integration ====================
+        # Calculate model dimensions for StateMemoryPool
+        self.n_head = config.dim_att // getattr(config, 'head_size', 64)
+        self.head_size = getattr(config, 'head_size', 64)
+        
+        # State Memory Pool
+        self.state_pool = StateMemoryPool(
+            total_dim=config.n_embd,
+            n_layer=config.n_layer,
+            n_head=self.n_head,
+            head_size=self.head_size,
+            device=None,  # Will be set automatically
+            dtype=torch.float32
+        )
+        
+        # State management flags
+        self.using_state_pool = config.use_multi_state
+        self.current_system_tokens = None
+        
+        # 应用配置到状态池
+        self._apply_config_to_state_pool()
+        
+        print(f"[RunningWay] Initialized with StateMemoryPool: {config.n_layer} layers, {self.n_head} heads")
+        print(f"[RunningWay] Multi-State: {'Enabled' if config.use_multi_state else 'Disabled'}")
+        # ==================== End RunningWay Integration ====================
+
+    def _apply_config_to_state_pool(self):
+        """应用配置到状态池"""
+        config = self.config
+        
+        # 设置窗口大小
+        if hasattr(self.state_pool, 'window_size'):
+            self.state_pool.window_size = config.window_size
+        
+        # 设置默认状态分配比例
+        if hasattr(self.state_pool, 'default_state_ratios'):
+            self.state_pool.default_state_ratios = config.default_state_ratios.copy()
+        
+        # 设置当前分配比例
+        if hasattr(self.state_pool, 'alpha_sys'):
+            self.state_pool.alpha_sys = config.default_state_ratios['system']
+            self.state_pool.alpha_rnn = config.default_state_ratios['rnn']
+            self.state_pool.alpha_win = config.default_state_ratios['window']
 
     def configure_optimizers(self):
-        args = self.args
+        config = self.config
         
         lr_decay = set()
         lr_1x = set()
@@ -515,10 +650,25 @@ class RWKV(pl.LightningModule):
         for n, p in self.named_parameters():
             if ("att.w0" in n):
                 lr_2x.add(n)
-            elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and (".weight" in n):
+            elif (len(p.squeeze().shape) >= 2) and (config.weight_decay > 0) and (".weight" in n):
                 lr_decay.add(n)
             else:
                 lr_1x.add(n)
+
+        # ==================== RunningWay Optimizer Groups ====================
+        # Add StateMemoryPool parameters to appropriate groups
+        for n, p in self.named_parameters():
+            if "state_pool" in n:
+                if "allocator" in n or "state_gate_net" in n:
+                    # State gating networks - use standard learning rate
+                    lr_1x.add(n)
+                elif "system_proj" in n:
+                    # System projection - use standard learning rate  
+                    lr_1x.add(n)
+                else:
+                    # State buffers - no weight decay
+                    lr_1x.add(n)
+        # ==================== End RunningWay Optimizer Groups ====================
 
         lr_decay = sorted(list(lr_decay))
         lr_1x = sorted(list(lr_1x))
@@ -536,37 +686,108 @@ class RWKV(pl.LightningModule):
             {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
         ]
 
-        if args.weight_decay > 0:
-            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
+        if config.weight_decay > 0:
+            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": config.weight_decay, "my_lr_scale": 1.0}]
             if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                return DeepSpeedCPUAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
+            from torch.optim import FusedAdam
+            return FusedAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
         else:
             if self.deepspeed_offload:
-                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                return DeepSpeedCPUAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
+            from torch.optim import FusedAdam
+            return FusedAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
 
     @property
     def deepspeed_offload(self) -> bool:
         strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
+        if hasattr(strategy, 'config') and 'zero_optimization' in strategy.config:
             cfg = strategy.config["zero_optimization"]
             return cfg.get("offload_optimizer") or cfg.get("offload_param")
         return False
 
+    # ==================== RunningWay State Management ====================
+    def set_system_prompt(self, system_tokens: torch.Tensor):
+        """Set system prompt for the model"""
+        if system_tokens is None:
+            self.state_pool.reset_for_no_system()
+            self.current_system_tokens = None
+        else:
+            self.current_system_tokens = system_tokens
+            # Encode system tokens to get embeddings
+            with torch.no_grad():
+                system_emb = self.emb(system_tokens).unsqueeze(0)  # [1, seq_len, n_embd]
+                self.state_pool.set_system_prompt(system_emb)
+    
+    def reset_state(self, keep_system: bool = True):
+        """Reset model state while optionally keeping system prompt"""
+        self.state_pool.reset_all_states()
+        if keep_system and self.current_system_tokens is not None:
+            self.set_system_prompt(self.current_system_tokens)
+        else:
+            self.state_pool.reset_for_no_system()
+    
+    def enable_state_pool(self):
+        """Enable state pool usage"""
+        self.using_state_pool = True
+        self.config.use_multi_state = True
+    
+    def disable_state_pool(self):
+        """Disable state pool usage (fallback to original RWKV)"""
+        self.using_state_pool = False
+        self.config.use_multi_state = False
+    
+    def get_config(self) -> RunningWayConfig:
+        """获取当前配置"""
+        return self.config
+    
+    def update_config(self, **kwargs):
+        """动态更新配置"""
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                old_value = getattr(self.config, key)
+                setattr(self.config, key, value)
+                print(f"[Config] Updated {key}: {old_value} -> {value}")
+        
+        # 重新应用配置到状态池
+        self._apply_config_to_state_pool()
+    # ==================== End RunningWay State Management ====================
+
     def forward(self, idx):
-        args = self.args
+        config = self.config
         B, T = idx.size()
-        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+        assert T <= config.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
         x = self.emb(idx)
 
         v_first = torch.empty_like(x)
-        for block in self.blocks:
-            if args.grad_cp == 1:
-                x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
-            else:
-                x, v_first = block(x, v_first)
+        
+        # ==================== RunningWay Forward Pass ====================
+        if self.using_state_pool and self.state_pool is not None:
+            # Use state pool for all blocks
+            for i, block in enumerate(self.blocks):
+                if config.grad_cp == 1:
+                    # For gradient checkpointing, we need to handle state_pool specially
+                    # Since checkpointing doesn't support non-tensor inputs well,
+                    # we'll use a wrapper function
+                    def block_forward(block, x, v_first, i):
+                        return block(x, v_first, self.state_pool, i)
+                    
+                    from pytorch_lightning.utilities import deepspeed
+                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, block, x, v_first, i)
+                else:
+                    x, v_first = block(x, v_first, self.state_pool, i)
+        else:
+            # Original RWKV forward without state pool
+            for block in self.blocks:
+                if config.grad_cp == 1:
+                    from pytorch_lightning.utilities import deepspeed
+                    x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                else:
+                    x, v_first = block(x, v_first)
+        # ==================== End RunningWay Forward Pass ====================
 
         x = self.ln_out(x)
         x = self.head(x)
@@ -574,6 +795,14 @@ class RWKV(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         idx, targets = batch
+        
+        # ==================== RunningWay Training Setup ====================
+        # For training, we typically don't want persistent state across batches
+        # Reset state at the beginning of each training step
+        if self.using_state_pool and self.config.reset_state_per_batch:
+            self.reset_state(keep_system=False)
+        # ==================== End RunningWay Training Setup ====================
+        
         logits = self(idx)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return L2Wrap.apply(loss, logits)
@@ -595,7 +824,36 @@ class RWKV(pl.LightningModule):
         )
         m = {}
         n_params = 0
+        
+        # ==================== RunningWay Weight Initialization ====================
+        # First, initialize StateMemoryPool weights
+        state_pool_params = {}
+        for n, p in self.state_pool.named_parameters():
+            if "allocator" in n:
+                # Allocator network - use standard initialization
+                if n.endswith('.weight'):
+                    nn.init.xavier_uniform_(p)
+                else:
+                    nn.init.zeros_(p)
+            elif "system_proj" in n and n.endswith('.weight'):
+                # System projection - use orthogonal initialization
+                nn.init.orthogonal_(p, gain=0.1)
+            elif "state_gate_net" in n:
+                # State gate network - already initialized in RNW_Tmix
+                pass
+            state_pool_params[n] = p
+        
+        # Add state pool params to the main state dict
+        for n, p in state_pool_params.items():
+            m[f"state_pool.{n}"] = p
+            print(f"state_pool.{n}: {p.shape} - custom init")
+        # ==================== End RunningWay Weight Initialization ====================
+
         for n in self.state_dict():
+            # Skip state_pool parameters as we've already handled them
+            if "state_pool" in n:
+                continue
+                
             p = self.state_dict()[n]
             shape = p.shape
 
@@ -608,7 +866,7 @@ class RWKV(pl.LightningModule):
             scale = 1.0
             if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias') or (".weight" not in n):
                 if 'ln_x.weight' in n:
-                    layer_scale = (1+int(n.split('.')[1])) / self.args.n_layer
+                    layer_scale = (1+int(n.split('.')[1])) / self.config.n_layer
                     m[n] = (p * 0.0) + (layer_scale ** 0.7)
                 else:
                     m[n] = p
@@ -620,8 +878,8 @@ class RWKV(pl.LightningModule):
                 print(f" [scale {scale}]")
             elif n == "head.weight":
                 m[n] = p
-                if self.args.vocab_size > self.args.n_embd:
-                    scale = 0.5 * math.sqrt(self.args.vocab_size / self.args.n_embd)
+                if self.config.vocab_size > self.config.n_embd:
+                    scale = 0.5 * math.sqrt(self.config.vocab_size / self.config.n_embd)
                 else:
                     scale = 0.5
                 nn.init.orthogonal_(m[n], gain=scale)
@@ -644,7 +902,7 @@ class RWKV(pl.LightningModule):
 
                 print(f" [scale {scale}]")
 
-                if self.args.accelerator.upper() == "GPU":
+                if self.config.accelerator.upper() == "GPU":
                     m[n] = torch.empty((shape[0], shape[1]), device="cuda")
                 else:
                     m[n] = torch.empty((shape[0], shape[1]))
@@ -657,9 +915,9 @@ class RWKV(pl.LightningModule):
                     nn.init.orthogonal_(m[n], gain=scale)
 
             m[n] = m[n].cpu()
-            if os.environ["RWKV_FLOAT_MODE"] == "fp16":
+            if os.environ.get("RWKV_FLOAT_MODE") == "fp16":
                 m[n] = m[n].half()
-            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
+            elif os.environ.get("RWKV_FLOAT_MODE") == "bf16":
                 m[n] = m[n].bfloat16()
             n_params += m[n].numel()
 
@@ -667,3 +925,83 @@ class RWKV(pl.LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
         return m
+
+    # ==================== RunningWay Inference Methods ====================
+    def generate_with_state(self, input_tokens, max_length=100, temperature=1.0, keep_state=True):
+        """
+        Generate text using state pool for consistent long-context generation
+        """
+        self.eval()
+        generated = input_tokens.clone()
+        
+        with torch.no_grad():
+            for _ in range(max_length):
+                # Get model output
+                logits = self(generated)
+                next_token_logits = logits[:, -1, :] / temperature
+                
+                # Sample next token
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                # Append to generated sequence
+                generated = torch.cat([generated, next_token], dim=1)
+                
+                # Stop if we exceed context length
+                if generated.size(1) >= self.config.ctx_len:
+                    break
+        
+        # Reset state if not keeping it
+        if not keep_state:
+            self.reset_state()
+            
+        return generated
+    
+    def get_state_info(self):
+        """Get information about current state usage"""
+        if not self.using_state_pool or self.state_pool is None:
+            return {"state_pool_enabled": False}
+        
+        info = {
+            "state_pool_enabled": True,
+            "has_system_prompt": self.state_pool.has_system_prompt,
+            "allocation_ratios": {
+                "system": self.state_pool.alpha_sys,
+                "rnn": self.state_pool.alpha_rnn,
+                "window": self.state_pool.alpha_win
+            },
+            "rnn_state_norm": self.state_pool.rnn_state.norm().item(),
+            "window_state_norm": self.state_pool.window_state.norm().item()
+        }
+        
+        if self.state_pool.has_system_prompt:
+            info["system_state_norm"] = self.state_pool.system_state_buffer.norm().item()
+            
+        return info
+    
+    def print_model_info(self):
+        """打印模型信息"""
+        config = self.config
+        print("=" * 60)
+        print("RunningWay Model Information")
+        print("=" * 60)
+        print(f"🏗️  Architecture:")
+        print(f"   - Layers: {config.n_layer}")
+        print(f"   - Embedding Dim: {config.n_embd}")
+        print(f"   - Attention Dim: {config.dim_att}")
+        print(f"   - Head Size: {config.head_size}")
+        print(f"   - Context Length: {config.ctx_len}")
+        
+        print(f"\n⚙️  Multi-State:")
+        print(f"   - Enabled: {'✅' if self.using_state_pool else '❌'}")
+        if self.using_state_pool:
+            print(f"   - Window Size: {config.window_size}")
+            print(f"   - Default Ratios: {config.default_state_ratios}")
+            print(f"   - Reset Per Batch: {'✅' if config.reset_state_per_batch else '❌'}")
+        
+        print(f"\n📊 Training:")
+        print(f"   - Learning Rate: {config.lr_init}")
+        print(f"   - Weight Decay: {config.weight_decay}")
+        print(f"   - Gradient Checkpoint: {'✅' if config.grad_cp == 1 else '❌'}")
+        print("=" * 60)
+    # ==================== End RunningWay Inference Methods ====================
