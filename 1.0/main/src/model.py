@@ -566,20 +566,6 @@ class RunningWay(pl.LightningModule):
         self.config = config
         self.save_hyperparameters(ignore=['config'])  # 保存配置到 checkpoint
         
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
         # 自动设置默认值（保持与原始代码兼容）
         if not hasattr(config, 'dim_att'):
             config.dim_att = config.n_embd
