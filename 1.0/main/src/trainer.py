@@ -271,7 +271,7 @@ def generate_init_weight(model, init_weight_name):
         config = model.args
 
     if config.train_stage == 1:
-        if len(config.load_model) > 0:
+        if config.load_model != "0":
             print(f"Combine weights from {config.load_model}...")
             load_dict = torch.load(config.load_model, map_location="cpu")
             for k in load_dict:

@@ -13,6 +13,8 @@ class RunningWayConfig:
     n_embd: int = 768
     n_layer: int = 12
     ctx_len: int = 4096
+    precision: str = "fp16-mixed"
+    my_testing: str = "r010"
     
     # === 注意力参数 ===
     dim_att: Optional[int] = None  # None 表示使用 n_embd
@@ -45,26 +47,71 @@ class RunningWayConfig:
     
     # === 训练参数 ===
     lr_init: float = 1e-4
+    lr_final: float = 1e-5
     betas: tuple = (0.9, 0.999)
     adam_eps: float = 1e-8
     weight_decay: float = 0.01
     grad_cp: int = 0  # 梯度检查点
+    grad_clip: float = 1.0
+    warmup_steps: int = -1
+    beta1: float = 0.9
+    beta2: float = 0.99
     
-    # === 其他参数 ===
-    my_testing: bool = False
+    # === Trainer 相关参数 ===
     accelerator: str = "gpu"
+    devices: int = 1
+    num_nodes: int = 1
+    strategy: str = "deepspeed_stage_2"
+    ds_bucket_mb: int = 200
+    micro_bsz: int = 12
+    epoch_steps: int = 1000
+    epoch_count: int = 500
+    epoch_begin: int = 0
+    epoch_save: int = 5
+    train_stage: int = 0
+    load_model: str = "0"
+    load_partial: int = 0
+    magic_prime: int = 0
+    my_exit_tokens: int = 0
+    enable_checkpointing: bool = False
+    replace_sampler_ddp: bool = False
+    logger: bool = False
+    num_sanity_val_steps: int = 0
+    check_val_every_n_epoch: int = int(1e20)
+    log_every_n_steps: int = int(1e20)
+    max_epochs: int = -1
+    real_bsz: int = 0  # Will be calculated based on num_nodes * devices * micro_bsz
     
-    def __post_init__(self):
+    # === 数据相关参数 ===
+    data_file: str = ""
+    data_type: str = "utf-8"
+    
+    # === Wandb 参数 ===
+    wandb: str = ""
+    experiment_name: str = "runningway_stage1"
+    run_name: str = ""
+    
+    # === 路径参数 ===
+    proj_dir: str = "out"
+    random_seed: int = -1
+    
+    # === 配置管理 ===
+    config: str = ""
+    save_config: str = ""
+    
+    def post_init(self):
         """初始化后处理"""
         # 自动计算 dim_att
-        if self.dim_att is None:
+        if self.dim_att is None or self.dim_att <= 0:
             self.dim_att = self.n_embd
             
         # 自动计算 dim_ffn
-        if self.dim_ffn is None:
+        if self.dim_ffn is None or self.dim_ffn <= 0:
             self.dim_ffn = int((self.n_embd * 3.5) // 32 * 32)
             
         # 验证参数
+        assert self.dim_att != 0
+        assert self.dim_ffn != 0
         assert self.n_embd % 32 == 0
         assert self.dim_att % 32 == 0
         assert self.dim_ffn % 32 == 0
@@ -133,15 +180,17 @@ class RunningWayConfig:
     def print_config(self):
         """打印配置信息"""
         print("=" * 60)
-        print("RunningWay Configuration")
+        print(f"RunningWay {self.my_testing} Configuration")
         print("=" * 60)
         
-        print(f"📊 Model Size: {self.n_layer} layers, {self.n_embd} dim, {self.ctx_len} ctx_len")
-        print(f"⚙️  Multi-State: {'Enabled' if self.use_multi_state else 'Disabled'}")
+        print(f"Model Size: {self.n_layer} layers, {self.n_embd} dim, {self.ctx_len} ctx_len, {self.precision.upper()}")
+        print(f"Multi-State: {'Enabled' if self.use_multi_state else 'Disabled'}")
         if self.use_multi_state:
             print(f"   - Window Size: {self.window_size}")
             print(f"   - State Ratios: {self.default_state_ratios}")
             print(f"   - System Prompt Frozen: {self.system_prompt_frozen}")
-        print(f"🔧 CUDA Kernel: {'New' if self.use_new_cuda_kernel else 'Original + Fallback'}")
-        print(f"📈 Training: LR={self.lr_init}, Weight Decay={self.weight_decay}")
+        print(f"CUDA Kernel: {'New' if self.use_new_cuda_kernel else 'Original + Fallback'}")
+        print(f"Training: LR Init={self.lr_init}, LR Final={self.lr_final}, Weight Decay={self.weight_decay}, Dim Att={self.dim_att}, Dim Ffn={self.dim_ffn}")
+        print(f"Accelerator: {self.accelerator}")
+        
         print("=" * 60)

@@ -141,7 +141,7 @@ python train.py \
  --precision $PRECISION \
  --proj_dir $PROJ_DIR \
  --strategy $STRATEGY \
- --train_stage 3 \
+ --train_stage 1 \
  --vocab_size $VOCAB_SIZE \
  --warmup_steps $WARMUP_STEPS \
  --weight_decay $WEIGHT_DECAY \
@@ -155,4 +155,4 @@ python train.py \
  --window_ratio $WINDOW_RATIO \
  --use_new_cuda_kernel $USE_NEW_CUDA_KERNEL \
  --fallback_to_python $FALLBACK_TO_PYTHON \
-  --config $CONFIG_FILE
+ --config $CONFIG_FILE

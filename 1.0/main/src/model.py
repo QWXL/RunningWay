@@ -4,6 +4,7 @@
 ########################################################################################################
 
 import os, math, gc, importlib
+import sys
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,13 +15,17 @@ if importlib.util.find_spec('deepspeed'):
     import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from typing import Optional
-from main.rnw.runningway_config import RunningWayConfig
-from main.rnw.state_pool import StateMemoryPool
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from rnw.runningway_config import RunningWayConfig
+from rnw.state_pool import StateMemoryPool
 
 try:
     print('RNW_MY_TESTING', os.environ["RNW_MY_TESTING"])
 except:
     os.environ["RNW_MY_TESTING"] = ''
+
+# 设置 RNW_JIT_ON 环境变量的默认值
+os.environ.setdefault("RNW_JIT_ON", "0")
 
 def __nop(ob):
     return ob
@@ -38,6 +43,7 @@ if os.environ["RNW_JIT_ON"] == "1":
 ########################################################################################################
 
 from torch.utils.cpp_extension import load
+os.environ.setdefault("RNW_HEAD_SIZE", "64")
 
 HEAD_SIZE = int(os.environ["RNW_HEAD_SIZE"])
 
@@ -213,7 +219,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .config import RunningWayConfig
+from rnw.runningway_config import RunningWayConfig
 
 class RNW_Tmix(MyModule):
     def __init__(self, config: RunningWayConfig, layer_id: int):
@@ -222,7 +228,7 @@ class RNW_Tmix(MyModule):
         self.layer_id = layer_id
         self.my_testing = config.my_testing
 
-        self.head_size = config.head_size
+        self.head_size = getattr(config, 'head_size', 64)  # 默认值为64
         self.n_head = config.dim_att // self.head_size
         assert config.dim_att % self.n_head == 0
         H = self.n_head
@@ -510,7 +516,7 @@ class RWKV_CMix_x070(MyModule):
 
 import torch
 import torch.nn as nn
-from main.rnw.runningway_config import RunningWayConfig
+from rnw.runningway_config import RunningWayConfig
 
 class Block(nn.Module):
     def __init__(self, config: RunningWayConfig, layer_id: int):
@@ -972,23 +978,24 @@ class RunningWay(pl.LightningModule):
         print("=" * 60)
         print("RunningWay Model Information")
         print("=" * 60)
-        print(f"🏗️  Architecture:")
+        print(f"Architecture:")
         print(f"   - Layers: {config.n_layer}")
         print(f"   - Embedding Dim: {config.n_embd}")
         print(f"   - Attention Dim: {config.dim_att}")
         print(f"   - Head Size: {config.head_size}")
         print(f"   - Context Length: {config.ctx_len}")
         
-        print(f"\n⚙️  Multi-State:")
-        print(f"   - Enabled: {'✅' if self.using_state_pool else '❌'}")
+        print(f"\nMulti-State:")
+        print(f"   - Enabled: {'√' if self.using_state_pool else '×'}")
         if self.using_state_pool:
             print(f"   - Window Size: {config.window_size}")
             print(f"   - Default Ratios: {config.default_state_ratios}")
-            print(f"   - Reset Per Batch: {'✅' if config.reset_state_per_batch else '❌'}")
+            print(f"   - Reset Per Batch: {'√' if config.reset_state_per_batch else '×'}")
         
-        print(f"\n📊 Training:")
+        print(f"\nTraining:")
         print(f"   - Learning Rate: {config.lr_init}")
         print(f"   - Weight Decay: {config.weight_decay}")
-        print(f"   - Gradient Checkpoint: {'✅' if config.grad_cp == 1 else '❌'}")
+        print(f"   - Gradient Checkpoint: {'√' if config.grad_cp == 1 else '×'}")
+        print(f"   - Load Model: {config.load_model}")
         print("=" * 60)
     # ==================== End RunningWay Inference Methods ====================

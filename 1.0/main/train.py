@@ -110,21 +110,14 @@ if __name__ == "__main__":
     # === 创建 RunningWay 配置 ===
     ########################################################################################################
     
-    # 从命令行参数创建配置
-    if args.config and os.path.exists(args.config):
-        rank_zero_info(f"Loading RunningWayConfig from {args.config}")
-        config = RunningWayConfig.load(args.config)
-        # 命令行参数覆盖配置文件
-        config = config.merge_with(RunningWayConfig.from_args(args))
-    else:
-        rank_zero_info("Creating RunningWayConfig from command line arguments")
-        # 创建临时 args 对象
-        temp_args = type('TempArgs', (), {})()
-        for key, value in vars(args).items():
-            if hasattr(RunningWayConfig, key):
-                setattr(temp_args, key, value)
-        config = RunningWayConfig.from_args(temp_args)
-    
+    rank_zero_info("Creating RunningWayConfig from command line arguments")
+    # 创建临时 args 对象
+    temp_args = type('TempArgs', (), {})()
+    for key, value in vars(args).items():
+        if hasattr(RunningWayConfig, key):
+            setattr(temp_args, key, value)
+    config = RunningWayConfig.from_args(temp_args)
+    config.post_init()
     # 设置 RunningWay 特有参数
     config.use_multi_state = args.use_multi_state
     config.window_size = args.window_size

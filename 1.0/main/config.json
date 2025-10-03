@@ -17,7 +17,6 @@
     "epoch_save": 1,
     "epoch_begin": 0,
     "epoch_count": 999999,
-    "train_stage": 3,
     "warmup_steps": 5500,
     "weight_decay": 0.001,
     "adam_eps": 1e-6,
@@ -39,7 +38,7 @@
   },
   "system": {
     "n_node": 1,
-    "gpu_per_node": "auto",
+    "gpu_per_node": "2",
     "ds_bucket_mb": 2,
     "precision": "fp16",
     "strategy": "deepspeed_stage_2",
