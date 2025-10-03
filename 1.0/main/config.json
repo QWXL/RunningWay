@@ -1,0 +1,57 @@
+{
+  "model": {
+    "name": "running-way-beta-0",
+    "type": "r010",
+    "n_layer": 12,
+    "n_embd": 768,
+    "ctx_len": 4096,
+    "head_size": 64,
+    "vocab_size": 65536
+  },
+  "training": {
+    "micro_bsz": 4,
+    "lr_init": 1e-5,
+    "lr_final": 1e-6,
+    "grad_cp": 1,
+    "grad_clip": 0.5,
+    "epoch_save": 1,
+    "epoch_begin": 0,
+    "epoch_count": 999999,
+    "train_stage": 3,
+    "warmup_steps": 5500,
+    "weight_decay": 0.001,
+    "adam_eps": 1e-6,
+    "beta1": 0.9,
+    "beta2": 0.99,
+    "load_model": "0",
+    "runningway": {
+      "use_multi_state": true,
+      "window_size": 1024,
+      "reset_state_per_batch": false,
+      "system_prompt_frozen": true,
+      "state_pool_learning_rate": 1e-4,
+      "system_ratio": 0.3,
+      "rnn_ratio": 0.4,
+      "window_ratio": 0.3,
+      "use_new_cuda_kernel": false,
+      "fallback_to_python": true
+    }
+  },
+  "system": {
+    "n_node": 1,
+    "gpu_per_node": "auto",
+    "ds_bucket_mb": 2,
+    "precision": "fp16",
+    "strategy": "deepspeed_stage_2",
+    "accelerator": "gpu"
+  },
+  "data": {
+    "data_file": "/mnt/fd741584-4993-4079-ae43-dfd853280c82/runningway/datasets/data/mini-test_text_document",
+    "data_type": "binidx",
+    "magic_prime": 234293,
+    "my_exit_tokens": 959723409
+  },
+  "paths": {
+    "proj_dir": "out/L12-D768-r010"
+  }
+}

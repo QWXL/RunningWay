@@ -174,7 +174,7 @@ if 'r010' in os.environ["RNW_MY_TESTING"]:
         print(f"[_run_multi_state_fallback] Original WKV computation completed")
         
         # 模拟状态融合的影响（简化版本）
-        # 在实际应用中，这应该更精细地模拟三个状态的影响
+        # TODO: 应该更精细的操作状态融合
         if fused_state is not None:
             fused_effect = torch.zeros_like(main_output)
             
@@ -399,7 +399,7 @@ class RNW_Tmix(MyModule):
 
         # ==================== WKV 计算与状态偏置 ====================
         # 使用兼容性包装器进行 WKV 计算
-        x = RUN_CUDA_RWKV7g_compatible(r, w, k, v, -kk, kk * a)
+        x = RUN_CUDA_RWKV7g_compatible(r, w, k, v, -kk, kk * a, fused_state)
         
         # 应用状态偏置
         x = x + state_bias
@@ -419,7 +419,8 @@ class RNW_Tmix(MyModule):
                 last_v = v[:, -1, :].view(B, H, -1)  # [B, H, head_size]
                 last_r = r[:, -1, :].view(B, H, -1)  # [B, H, head_size]
                 
-                # 计算状态更新（简化版）
+                # 计算状态更新
+                # TODO: 添加状态更新逻辑、改用矩阵状态、添加时间衰减等
                 state_update = last_k * last_v * last_r
                 
                 # 使用衰减更新 RNN 状态

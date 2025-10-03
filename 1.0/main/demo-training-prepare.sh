@@ -12,12 +12,12 @@
 #
 #######################################################################################################################
 #
-MODEL_TYPE="x070" # x070 => rwkv-7.0
+MODEL_TYPE="r010" # x070 => rwkv-7.0
 #
 N_LAYER="12"
 N_EMBD="768"
 #
-CTX_LEN="512" # !!! change magic_prime if you change ctx_len !!!
+CTX_LEN="4096" # !!! change magic_prime if you change ctx_len !!!
 PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 #
 #######################################################################################################################
@@ -43,8 +43,8 @@ python train.py \
     --micro_bsz 1\
     --n_layer $N_LAYER \
     --n_embd $N_EMBD \
-    --my_exit_tokens 1498226207 \
-    --magic_prime 2926181 \
+    --my_exit_tokens 959723409 \
+    --magic_prime 234293 \
     --lr_init 1e-5 \
     --lr_final 1e-5 \
     --warmup_steps 10 \

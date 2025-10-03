@@ -53,10 +53,10 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", default=1.0, type=float)
 
     # === RunningWay 特有参数 ===
-    parser.add_argument("--use_multi_state", action='store_true', default=True, help="Enable multi-state mechanism")
+    parser.add_argument("--use_multi_state", default=True, type=lambda x: (str(x).lower() == 'true'), help="Enable multi-state mechanism")
     parser.add_argument("--window_size", type=int, default=1024, help="Sliding window size for state")
-    parser.add_argument("--reset_state_per_batch", action='store_true', default=True, help="Reset state for each training batch")
-    parser.add_argument("--system_prompt_frozen", action='store_true', default=True, help="Freeze system prompt state")
+    parser.add_argument("--reset_state_per_batch", default=True, type=lambda x: (str(x).lower() == 'true'), help="Reset state for each training batch")
+    parser.add_argument("--system_prompt_frozen", default=True, type=lambda x: (str(x).lower() == 'true'), help="Freeze system prompt state")
     parser.add_argument("--state_pool_learning_rate", type=float, default=1e-4, help="Learning rate for state pool parameters")
     
     # === 状态分配比例 ===
@@ -65,8 +65,8 @@ if __name__ == "__main__":
     parser.add_argument("--window_ratio", type=float, default=0.3, help="Window state ratio")
 
     # === 兼容性参数 ===
-    parser.add_argument("--use_new_cuda_kernel", action='store_true', default=False, help="Use new CUDA kernel for multi-state")
-    parser.add_argument("--fallback_to_python", action='store_true', default=False, help="Fallback to Python implementation")
+    parser.add_argument("--use_new_cuda_kernel", default=False, type=lambda x: (str(x).lower() == 'true'), help="Use new CUDA kernel for multi-state")
+    parser.add_argument("--fallback_to_python", default=False, type=lambda x: (str(x).lower() == 'true'), help="Fallback to Python implementation")
 
     # === 原始 RWKV 参数 ===
     parser.add_argument("--train_stage", default=0, type=int)

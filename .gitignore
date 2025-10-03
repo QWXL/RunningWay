@@ -212,3 +212,8 @@ json2binidx_tool/
 
 datasets/files/*
 datasets/outputs/*
+
+nohup.out
+
+*.bin
+*.idx
