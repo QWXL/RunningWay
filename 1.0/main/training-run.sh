@@ -32,6 +32,10 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
+export NCCL_IB_DISABLE=1 
+export NCCL_P2P_DISABLE=0
+export NCCL_DEBUG=INFO
+
 # Extract model variables from JSON config
 MODEL_NAME=$(jq -r '.model.name' "$CONFIG_FILE")
 

@@ -11,8 +11,8 @@ from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
+import deepspeed 
 if importlib.util.find_spec('deepspeed'):
-    import deepspeed
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from typing import Optional
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -22,7 +22,7 @@ from rnw.state_pool import StateMemoryPool
 try:
     print('RNW_MY_TESTING', os.environ["RNW_MY_TESTING"])
 except:
-    os.environ["RNW_MY_TESTING"] = ''
+    os.environ["RNW_MY_TESTING"] = 'r010'
 
 # 设置 RNW_JIT_ON 环境变量的默认值
 os.environ.setdefault("RNW_JIT_ON", "0")
@@ -44,13 +44,15 @@ if os.environ["RNW_JIT_ON"] == "1":
 
 from torch.utils.cpp_extension import load
 os.environ.setdefault("RNW_HEAD_SIZE", "64")
+os.environ.setdefault("RNW_MY_TESTING", "r010")
 
 HEAD_SIZE = int(os.environ["RNW_HEAD_SIZE"])
 
 if 'r010' in os.environ["RNW_MY_TESTING"]:
+    print(f"[RNW] Load Cuda Kernel with {os.environ["RNW_MY_TESTING"]}")
     CHUNK_LEN = 16
 
-    # 修改现有的函数，添加对 fused_state 的支持
+    # 支持 fused_state，需要等待Cuda内核就绪
     flags = ['-res-usage', f'-D_C_={HEAD_SIZE}', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
     load(name="wind_backstepping", sources=[f'cuda/wkv7_cuda.cu', 'cuda/wkv7_op.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
     print(f"[RNW] Successfully loaded wind_backstepping kernel with HEAD_SIZE={HEAD_SIZE}, CHUNK_LEN={CHUNK_LEN}")
@@ -62,7 +64,7 @@ if 'r010' in os.environ["RNW_MY_TESTING"]:
             B,T,H,C = w.shape 
             print(f"[WindBackstepping_original] Forward: B={B}, T={T}, H={H}, C={C}")
             assert T%CHUNK_LEN == 0 # if T%CHUNK_LEN != 0: pad your input to T%CHUNK_LEN == 0, or change CHUNK_LEN (will be slower)
-            assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
+            # assert all(i.dtype==torch.bfloat16 for i in [w,q,k,v,z,b])
             assert all(i.is_contiguous() for i in [w,q,k,v,z,b])
             y = torch.empty_like(v)
             s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)
@@ -74,7 +76,7 @@ if 'r010' in os.environ["RNW_MY_TESTING"]:
         @staticmethod
         def backward(ctx, dy):
             print(f"[WindBackstepping_original] Backward started")
-            assert all(i.dtype==torch.bfloat16 for i in [dy])
+            # assert all(i.dtype==torch.bfloat16 for i in [dy])
             assert all(i.is_contiguous() for i in [dy])
             w,q,k,v,z,b,s,sa = ctx.saved_tensors
             dw,dq,dk,dv,dz,db = [torch.empty_like(x) for x in [w,q,k,v,z,b]]
@@ -124,6 +126,15 @@ if 'r010' in os.environ["RNW_MY_TESTING"]:
             )
             print(f"[WindBackstepping] Backward completed")
             return dw, dq, dk, dv, dz, db, dfused_state
+
+    # 保持向后兼容的原始函数
+    def RUN_CUDA_RWKV7g_original(q, w, k, v, a, b):
+        B,T,HC = q.shape
+        print(f"[RUN_CUDA_RWKV7g_original] Input shape: q={q.shape}, w={w.shape}, k={k.shape}, v={v.shape}, a={a.shape}, b={b.shape}")
+        q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
+        result = WindBackstepping_original.apply(w,q,k,v,a,b).view(B,T,HC)
+        print(f"[RUN_CUDA_RWKV7g_original] Completed")
+        return result
 
     USE_MULTI_STATE = True  # 设置为 False 可回退到原始行为
     USE_NEW_CUDA_KERNEL = False  # 初始为 False，等待新内核就绪
@@ -204,14 +215,7 @@ if 'r010' in os.environ["RNW_MY_TESTING"]:
         return main_output
 
 
-    # 保持向后兼容的原始函数
-    def RUN_CUDA_RWKV7g_original(q, w, k, v, a, b):
-        B,T,HC = q.shape
-        print(f"[RUN_CUDA_RWKV7g_original] Input shape: q={q.shape}, w={w.shape}, k={k.shape}, v={v.shape}, a={a.shape}, b={b.shape}")
-        q,w,k,v,a,b = [i.view(B,T,HC//64,64) for i in [q,w,k,v,a,b]]
-        result = WindBackstepping_original.apply(w,q,k,v,a,b).view(B,T,HC)
-        print(f"[RUN_CUDA_RWKV7g_original] Completed")
-        return result
+
 
 ########################################################################################################
 
@@ -675,23 +679,34 @@ class RunningWay(pl.LightningModule):
         param_dict = {n: p for n, p in self.named_parameters()}
         
         optim_groups = [
-            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
-            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
+            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "lr_scale": 1.0},
+            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "lr_scale": 2.0},
         ]
 
-        if config.weight_decay > 0:
-            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": config.weight_decay, "my_lr_scale": 1.0}]
-            if self.deepspeed_offload:
-                from deepspeed.ops.adam import DeepSpeedCPUAdam
-                return DeepSpeedCPUAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            from torch.optim import FusedAdam
-            return FusedAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+        if self.deepspeed_offload:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            optimizer = DeepSpeedCPUAdam(
+                optim_groups,
+                lr=config.lr_init,
+                betas=config.betas,
+                eps=config.adam_eps,
+                bias_correction=True,
+                adam_w_mode=(config.weight_decay > 0),
+                amsgrad=False
+            )
         else:
-            if self.deepspeed_offload:
-                from deepspeed.ops.adam import DeepSpeedCPUAdam
-                return DeepSpeedCPUAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            from torch.optim import FusedAdam
-            return FusedAdam(optim_groups, lr=config.lr_init, betas=config.betas, eps=config.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+            from deepspeed.ops.adam import FusedAdam
+            optimizer = FusedAdam(
+                optim_groups,
+                lr=config.lr_init,
+                betas=config.betas,
+                eps=config.adam_eps,
+                bias_correction=True,
+                adam_w_mode=(config.weight_decay > 0),
+                amsgrad=False
+            )
+
+        return optimizer
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -754,30 +769,28 @@ class RunningWay(pl.LightningModule):
         assert T <= config.ctx_len, "Cannot forward, model ctx_len is exhausted."
 
         x = self.emb(idx)
-
         v_first = torch.empty_like(x)
-        
+
         # ==================== RunningWay Forward Pass ====================
         if self.using_state_pool and self.state_pool is not None:
             # Use state pool for all blocks
             for i, block in enumerate(self.blocks):
                 if config.grad_cp == 1:
-                    # For gradient checkpointing, we need to handle state_pool specially
-                    # Since checkpointing doesn't support non-tensor inputs well,
-                    # we'll use a wrapper function
-                    def block_forward(block, x, v_first, i):
+                    # wrapper 避免非 tensor 参数报错
+                    def block_forward(x, v_first):
                         return block(x, v_first, self.state_pool, i)
-                    
-                    from pytorch_lightning.utilities import deepspeed
-                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, block, x, v_first, i)
+
+                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, x, v_first)
                 else:
                     x, v_first = block(x, v_first, self.state_pool, i)
         else:
             # Original RWKV forward without state pool
             for block in self.blocks:
                 if config.grad_cp == 1:
-                    from pytorch_lightning.utilities import deepspeed
-                    x, v_first = deepspeed.checkpointing.checkpoint(block, x, v_first)
+                    def block_forward(x, v_first):
+                        return block(x, v_first)
+
+                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, x, v_first)
                 else:
                     x, v_first = block(x, v_first)
         # ==================== End RunningWay Forward Pass ====================
@@ -785,6 +798,7 @@ class RunningWay(pl.LightningModule):
         x = self.ln_out(x)
         x = self.head(x)
         return x
+
 
     def training_step(self, batch, batch_idx):
         idx, targets = batch
@@ -840,10 +854,16 @@ class RunningWay(pl.LightningModule):
         for n, p in state_pool_params.items():
             m[f"state_pool.{n}"] = p
             print(f"state_pool.{n}: {p.shape} - custom init")
+            
+        # Add state pool buffers (like rnn_state, window_state, system_state_buffer)
+        for n, b in self.state_pool.named_buffers():
+            if isinstance(b, torch.Tensor):  # Only include tensor buffers
+                m[f"state_pool.{n}"] = b
+                print(f"state_pool.{n}: {b.shape} - buffer")
         # ==================== End RunningWay Weight Initialization ====================
 
         for n in self.state_dict():
-            # Skip state_pool parameters as we've already handled them
+            # Skip state_pool parameters and buffers as we've already handled them
             if "state_pool" in n:
                 continue
                 

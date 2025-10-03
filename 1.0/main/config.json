@@ -22,7 +22,7 @@
     "adam_eps": 1e-6,
     "beta1": 0.9,
     "beta2": 0.99,
-    "load_model": "0",
+    "load_model": "out/L12-D768-r010/runningway-init.pth",
     "runningway": {
       "use_multi_state": true,
       "window_size": 1024,

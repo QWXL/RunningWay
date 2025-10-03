@@ -57,7 +57,7 @@ class train_callback(pl.Callback):
         for param_group in trainer.optimizers[0].param_groups:
             if param_group["weight_decay"] > 0:
                 param_group["weight_decay"] = wd_now
-            param_group["lr"] = lr * param_group["my_lr_scale"]
+            param_group["lr"] = lr * param_group["lr_scale"]
 
         trainer.my_lr = lr
         trainer.my_wd = wd_now
@@ -271,7 +271,13 @@ def generate_init_weight(model, init_weight_name):
         config = model.args
 
     if config.train_stage == 1:
-        if config.load_model != "0":
+        load_model_is_valid = False
+        
+        # Check if load_model file exists
+        if len(config.load_model) > 0 and config.load_model != "0" and os.path.isfile(config.load_model):
+            load_model_is_valid = True
+        
+        if load_model_is_valid:
             print(f"Combine weights from {config.load_model}...")
             load_dict = torch.load(config.load_model, map_location="cpu")
             for k in load_dict:

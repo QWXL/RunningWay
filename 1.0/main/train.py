@@ -257,12 +257,14 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    # PyTorch Lightning 1.9.5 AMP 配置
     if args.precision == "fp32" or args.precision == "tf32":
         args.precision = 32
     elif args.precision == "fp16":
-        args.precision = "16-mixed"
+        args.precision = 16
     elif args.precision == "bf16":
-        args.precision = "bf16-mixed"
+        args.precision = "bf16"
+
 
     ########################################################################################################
 
@@ -333,12 +335,12 @@ if __name__ == "__main__":
         
         # 打印 RunningWay 特有信息
         rank_zero_info("\nRunningWay Stage 1 Features:")
-        rank_zero_info(f"  - Multi-State: {'✅' if config.use_multi_state else '❌'}")
+        rank_zero_info(f"  - Multi-State: {'√' if config.use_multi_state else '×'}")
         if config.use_multi_state:
             rank_zero_info(f"  - Window Size: {config.window_size}")
             rank_zero_info(f"  - State Ratios: {config.default_state_ratios}")
-            rank_zero_info(f"  - Reset Per Batch: {'✅' if config.reset_state_per_batch else '❌'}")
-        rank_zero_info(f"  - CUDA Kernel: {'🚀 New' if config.use_new_cuda_kernel else '📦 Original + Fallback'}")
+            rank_zero_info(f"  - Reset Per Batch: {'√' if config.reset_state_per_batch else '×'}")
+        rank_zero_info(f"  - CUDA Kernel: {'New' if config.use_new_cuda_kernel else 'Original + Fallback'}")
 
     if "deepspeed" in args.strategy:
         trainer.strategy.config["zero_optimization"]["allgather_bucket_size"] = args.ds_bucket_mb * 1000 * 1000

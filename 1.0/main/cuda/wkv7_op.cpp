@@ -1,6 +1,6 @@
 #include <torch/extension.h>
-#include <cuda_bf16.h>
-using bf = __nv_bfloat16;
+#include <cuda_fp16.h> // 使用 fp16
+using bf = __half; // 将原来的 __nv_bfloat16 改为 __half
 
 void cuda_forward(int B, int T, int H, bf*w, bf*q, bf*k, bf*v, bf*z, bf*a, bf*y, float*s, float*sa);
 

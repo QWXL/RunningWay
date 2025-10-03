@@ -1,9 +1,9 @@
-#include <cuda_bf16.h>
+#include <cuda_fp16.h> // 使用 fp16
 #include <assert.h>
 
-using bf = __nv_bfloat16;
-__device__ inline float to_float(const bf & u) { return __bfloat162float(u); }
-__device__ inline bf to_bf(const float & u) { return __float2bfloat16_rn(u); }
+using bf = __nv_half;
+__device__ inline float to_float(const bf & u) { return __half2float(u); }
+__device__ inline bf to_bf(const float & u) { return __float2half(u); }
 
 typedef bf * __restrict__ F_;
 
