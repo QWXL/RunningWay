@@ -12,9 +12,22 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 from pytorch_lightning.strategies import DeepSpeedStrategy
 import deepspeed 
+from typing import Optional
+# 使用 PyTorch 官方 checkpoint 防止 deepspeed.checkpointing 与 ZeRO 在某些配置下产生重复梯度
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+# ---- 增加：有助于 NCCL / torch.distributed 调试与更稳健的错误处理 ----
+# 这些 env 有助于打开更多 NCCL/Torch-NCCL 日志并启用异步错误处理
+os.environ.setdefault("NCCL_DEBUG", os.environ.get("NCCL_DEBUG", "INFO"))
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"))
+# 让 torch 的 NCCL trace buffer 非 0 以便在超时时能输出更多信息（已在日志提示）
+os.environ.setdefault("TORCH_NCCL_TRACE_BUFFER_SIZE", os.environ.get("TORCH_NCCL_TRACE_BUFFER_SIZE", "1"))
+os.environ.setdefault("TORCH_NCCL_DEBUG", os.environ.get("TORCH_NCCL_DEBUG", "INFO"))
+# 若环境中已禁止 ib（例如日志中看到 NCCL_IB_DISABLE=1），保持不覆盖，但在本地调试时可以考虑开启/关闭
+# -----------------------------------------------------------------
+
 if importlib.util.find_spec('deepspeed'):
     from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
-from typing import Optional
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from rnw.runningway_config import RunningWayConfig
 from rnw.state_pool import StateMemoryPool
@@ -576,7 +589,7 @@ class RunningWay(pl.LightningModule):
         super().__init__()
         self.config = config
         self.save_hyperparameters(ignore=['config'])  # 保存配置到 checkpoint
-        
+
         # 自动设置默认值（保持与原始代码兼容）
         if not hasattr(config, 'dim_att'):
             config.dim_att = config.n_embd
@@ -615,10 +628,40 @@ class RunningWay(pl.LightningModule):
         
         # 应用配置到状态池
         self._apply_config_to_state_pool()
-        
+
+        # Ensure distributed ranks use same runtime decision flags (avoid mismatched collectives)
+        # If torch.distributed is initialized, broadcast key config items from rank 0 to all ranks.
+        try:
+            self._sync_config_across_ranks()
+        except Exception as e:
+            print(f"[RunningWay] _sync_config_across_ranks failed: {e}")
+
         print(f"[RunningWay] Initialized with StateMemoryPool: {config.n_layer} layers, {self.n_head} heads")
         print(f"[RunningWay] Multi-State: {'Enabled' if config.use_multi_state else 'Disabled'}")
         # ==================== End RunningWay Integration ====================
+
+        # If debug flag set, dump param id mapping to help find duplicated/shared parameters.
+        try:
+            dbg_flag = os.environ.get("RNW_DEBUG_PARAM_IDS", "0") == "1" or getattr(config, "debug_param_ids", False)
+        except Exception:
+            dbg_flag = False
+        if dbg_flag:
+            try:
+                self._dump_param_debug_info("/tmp/rnw_param_debug_on_init.txt")
+            except Exception as e:
+                print(f"[RunningWay] Failed to dump param debug info on init: {e}")
+
+        # 可选：启用梯度重复调试（通过环境变量 RNW_DEBUG_GRAD=1 或 config.debug_grad）
+        try:
+            grad_dbg = os.environ.get("RNW_DEBUG_GRAD", "0") == "1" or getattr(config, "debug_grad", False)
+        except Exception:
+            grad_dbg = False
+        if grad_dbg:
+            try:
+                self._enable_grad_debug_hooks("/tmp/rnw_grad_hook_log.txt")
+                print("[RunningWay] Gradient debug hooks enabled (RNW_DEBUG_GRAD=1)")
+            except Exception as e:
+                print(f"[RunningWay] Failed to enable grad debug hooks: {e}")
 
     def _apply_config_to_state_pool(self):
         """应用配置到状态池"""
@@ -638,75 +681,205 @@ class RunningWay(pl.LightningModule):
             self.state_pool.alpha_rnn = config.default_state_ratios['rnn']
             self.state_pool.alpha_win = config.default_state_ratios['window']
 
+    def _sync_config_across_ranks(self):
+        """
+        在分布式训练启动时，从 rank0 广播若干关键运行时配置到其它 ranks，
+        避免不同 rank 在 forward/backward 中走不同分支导致 collectives 顺序不一致。
+        使用 broadcast_object_list（safe for arbitrary python objects）。
+        如果未初始化分布式或出现异常，则安静返回。
+        """
+        try:
+            import torch.distributed as dist
+        except Exception:
+            return
+
+        try:
+            if not dist.is_available() or not dist.is_initialized():
+                return
+            rank = dist.get_rank()
+            if rank == 0:
+                payload = {
+                    "use_multi_state": getattr(self.config, "use_multi_state", False),
+                    "window_size": getattr(self.config, "window_size", None),
+                    "grad_cp": getattr(self.config, "grad_cp", 0),
+                }
+            else:
+                payload = {}
+
+            # broadcast_object_list expects a list; mutate in-place on other ranks
+            obj = [payload]
+            dist.broadcast_object_list(obj, src=0)
+            # on non-zero ranks update local config with values from rank0
+            if rank != 0 and obj and isinstance(obj[0], dict):
+                d = obj[0]
+                # Update config fields and internal flags that affect control flow
+                if "use_multi_state" in d and d["use_multi_state"] is not None:
+                    old = getattr(self.config, "use_multi_state", None)
+                    setattr(self.config, "use_multi_state", d["use_multi_state"])
+                    self.using_state_pool = d["use_multi_state"]
+                if "window_size" in d and d["window_size"] is not None:
+                    setattr(self.config, "window_size", d["window_size"])
+                    if hasattr(self.state_pool, "window_size"):
+                        self.state_pool.window_size = d["window_size"]
+                if "grad_cp" in d and d["grad_cp"] is not None:
+                    setattr(self.config, "grad_cp", d["grad_cp"])
+        except Exception as e:
+            # 不抛出异常以免阻止训练流程，但打印以供排查
+            print(f"[RunningWay] _sync_config_across_ranks exception: {e}")
+
     def configure_optimizers(self):
         config = self.config
-        
-        lr_decay = set()
-        lr_1x = set()
-        lr_2x = set()
-        for n, p in self.named_parameters():
-            if ("att.w0" in n):
-                lr_2x.add(n)
-            elif (len(p.squeeze().shape) >= 2) and (config.weight_decay > 0) and (".weight" in n):
-                lr_decay.add(n)
-            else:
-                lr_1x.add(n)
+        base_lr = config.lr_init
 
-        # ==================== RunningWay Optimizer Groups ====================
-        # Add StateMemoryPool parameters to appropriate groups
+        # 简化且稳健的参数分组：一次遍历，确保每个参数只属于一个组，避免重复加入导致的重复梯度归约错误。
+        # 使用有序字典记录所有可训练参数以保持顺序并便于按 id 去重
+        from collections import OrderedDict
+        trainable_by_id = OrderedDict()
         for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if id(p) not in trainable_by_id:
+                trainable_by_id[id(p)] = (n, p)
+
+        decay_ids = []
+        no_decay_ids = []
+
+        for pid, (n, p) in trainable_by_id.items():
+            # 优先把 state_pool 放到 no_decay，避免特殊参数被误分组
             if "state_pool" in n:
-                if "allocator" in n or "state_gate_net" in n:
-                    # State gating networks - use standard learning rate
-                    lr_1x.add(n)
-                elif "system_proj" in n:
-                    # System projection - use standard learning rate  
-                    lr_1x.add(n)
-                else:
-                    # State buffers - no weight decay
-                    lr_1x.add(n)
-        # ==================== End RunningWay Optimizer Groups ====================
+                no_decay_ids.append(pid)
+                continue
 
-        lr_decay = sorted(list(lr_decay))
-        lr_1x = sorted(list(lr_1x))
-        lr_2x = sorted(list(lr_2x))
+            # 矩阵权重默认使用 weight decay（若配置开启）
+            if p.ndim >= 2 and n.endswith(".weight") and getattr(config, "weight_decay", 0) > 0:
+                decay_ids.append(pid)
+            else:
+                no_decay_ids.append(pid)
 
-        if self.trainer.is_global_zero:
-            print('decay', lr_decay, '\n')
-            print('1x', lr_1x, '\n')
-            print('2x', lr_2x, '\n')
+        # 如果有遗漏（理论上不应有），将其加入 no_decay，并打印警告而不是抛异常
+        all_assigned = set(decay_ids) | set(no_decay_ids)
+        missing_ids = [pid for pid in trainable_by_id.keys() if pid not in all_assigned]
+        if missing_ids:
+            for pid in missing_ids:
+                no_decay_ids.append(pid)
+            print(f"[configure_optimizers] Warning: found {len(missing_ids)} unassigned trainable params, added to no_decay.")
 
-        param_dict = {n: p for n, p in self.named_parameters()}
-        
-        optim_groups = [
-            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "lr_scale": 1.0},
-            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "lr_scale": 2.0},
-        ]
+        # 根据 id 重建 参数对象列表（保持原顺序）
+        def ids_to_params_list(ids_list):
+            out = []
+            seen = set()
+            for pid in ids_list:
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append(trainable_by_id[pid][1])
+            return out
 
-        if self.deepspeed_offload:
-            from deepspeed.ops.adam import DeepSpeedCPUAdam
-            optimizer = DeepSpeedCPUAdam(
-                optim_groups,
-                lr=config.lr_init,
-                betas=config.betas,
-                eps=config.adam_eps,
-                bias_correction=True,
-                adam_w_mode=(config.weight_decay > 0),
-                amsgrad=False
-            )
-        else:
-            from deepspeed.ops.adam import FusedAdam
-            optimizer = FusedAdam(
-                optim_groups,
-                lr=config.lr_init,
-                betas=config.betas,
-                eps=config.adam_eps,
-                bias_correction=True,
-                adam_w_mode=(config.weight_decay > 0),
-                amsgrad=False
-            )
+        no_decay_params = ids_to_params_list(no_decay_ids)
+        decay_params = ids_to_params_list(decay_ids)
 
+        optim_groups = []
+        if no_decay_params:
+            optim_groups.append({
+                "params": no_decay_params,
+                "lr": base_lr,
+                "weight_decay": 0.0
+            })
+        if decay_params:
+            optim_groups.append({
+                "params": decay_params,
+                "lr": base_lr,
+                "weight_decay": float(getattr(config, "weight_decay", 0.0))
+            })
+
+        # 额外保护：确保不同组之间没有重复的参数 id（从后面的组移除重复参数）
+        seen_ids = set()
+        cleaned_groups = []
+        for i, g in enumerate(optim_groups):
+            params = g.get("params", [])
+            new_params = []
+            removed = 0
+            for p in params:
+                pid = id(p)
+                if pid in seen_ids:
+                    removed += 1
+                    continue
+                seen_ids.add(pid)
+                new_params.append(p)
+            if removed:
+                print(f"[configure_optimizers] Removed {removed} duplicate params from group {i} to avoid double reduction.")
+            if len(new_params) > 0:
+                # shallow copy group dict but replace params
+                ng = dict(g)
+                ng["params"] = new_params
+                cleaned_groups.append(ng)
+            else:
+                print(f"[configure_optimizers] Dropping empty optimizer group {i} after deduplication.")
+        optim_groups = cleaned_groups
+
+        # 最终检查：确保没有重复且至少有参数
+        final_ids = []
+        for g in optim_groups:
+            final_ids.extend([id(p) for p in g["params"]])
+        from collections import Counter
+        dup_ids = [pid for pid, cnt in Counter(final_ids).items() if cnt > 1]
+        if dup_ids:
+            # 如果仍然有重复，导出诊断信息以便排查具体名称与来源
+            print(f"[configure_optimizers] Duplicate param ids remain after cleaning: {dup_ids}. Dumping debug info...")
+            try:
+                self._dump_param_debug_info("/tmp/rnw_param_debug_after_clean.txt")
+            except Exception as e:
+                print(f"[configure_optimizers] Failed to dump debug info: {e}")
+            raise RuntimeError(f"configure_optimizers: duplicate param ids remain after cleaning: {dup_ids}")
+        # 在找到未分配或重复问题前，也在这里把全部注册情况写一份（可选）
+        if os.environ.get("RNW_DEBUG_PARAM_IDS", "0") == "1":
+            try:
+                self._dump_param_debug_info("/tmp/rnw_param_debug_final.txt")
+            except Exception as e:
+                print(f"[configure_optimizers] Failed to dump final debug info: {e}")
+        if not optim_groups:
+            raise RuntimeError("configure_optimizers: no parameters found for optimizer after cleaning.")
+
+        # 尝试优先使用 DeepSpeed 的 CPU Adam（若存在），否则回退到 AdamW
+        # 支持环境变量或 config 强制禁用 deepspeed 优化器以便排查问题
+        force_no_deepspeed = getattr(config, "force_no_deepspeed", False) or os.environ.get("RNW_FORCE_NO_DEEPSPEED", "0") == "1"
+        if not force_no_deepspeed:
+            try:
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                optimizer = DeepSpeedCPUAdam(
+                    optim_groups,
+                    lr=base_lr,
+                    betas=config.betas,
+                    eps=config.adam_eps
+                )
+                # Dump optimizer groups for debugging if requested
+                try:
+                    if os.environ.get("RNW_DEBUG_OPTIMIZER", "0") == "1" or getattr(config, "debug_optimizer", False):
+                        self._dump_optimizer_group_info(optimizer, "/tmp/rnw_optimizer_param_groups.txt")
+                except Exception as _e:
+                    print(f"[configure_optimizers] Failed to dump optimizer info: {_e}")
+                    
+                return optimizer
+            except Exception as e:
+                print(f"[configure_optimizers] DeepSpeedCPUAdam unavailable or failed ({e}), falling back to torch.optim.AdamW")
+
+        import torch
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=base_lr,
+            betas=config.betas,
+            eps=config.adam_eps
+        )
+
+        try:
+            if os.environ.get("RNW_DEBUG_OPTIMIZER", "0") == "1" or getattr(config, "debug_optimizer", False):
+                self._dump_optimizer_group_info(optimizer, "/tmp/rnw_optimizer_param_groups.txt")
+        except Exception as _e:
+            print(f"[configure_optimizers] Failed to dump optimizer info: {_e}")
+ 
         return optimizer
+
+
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -776,21 +949,36 @@ class RunningWay(pl.LightningModule):
             # Use state pool for all blocks
             for i, block in enumerate(self.blocks):
                 if config.grad_cp == 1:
-                    # wrapper 避免非 tensor 参数报错
-                    def block_forward(x, v_first):
-                        return block(x, v_first, self.state_pool, i)
+                    # 只对 attention 子模块做 checkpoint（避免对整个 block 做 checkpoint 导致 FFN 参数重复梯度）
+                    if block.layer_id == 0:
+                        # 保持 ln0 行为
+                        x = block.ln0(x)
 
-                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, x, v_first)
+                    ln1_out = block.ln1(x)
+                    # checkpoint attention: returns (att_out, v_first)
+                    def att_fn(ln, v):
+                        return block.att(ln, v, self.state_pool, i)
+                    x_attn, v_first = torch_checkpoint(att_fn, ln1_out, v_first)
+                    x = x + x_attn
+
+                    # ffn 正常执行（不 checkpoint）
+                    x = x + block.ffn(block.ln2(x))
                 else:
                     x, v_first = block(x, v_first, self.state_pool, i)
         else:
             # Original RWKV forward without state pool
             for block in self.blocks:
                 if config.grad_cp == 1:
-                    def block_forward(x, v_first):
-                        return block(x, v_first)
+                    if block.layer_id == 0:
+                        x = block.ln0(x)
 
-                    x, v_first = deepspeed.checkpointing.checkpoint(block_forward, x, v_first)
+                    ln1_out = block.ln1(x)
+                    def att_fn(ln, v):
+                        return block.att(ln, v)
+                    x_attn, v_first = torch_checkpoint(att_fn, ln1_out, v_first)
+                    x = x + x_attn
+
+                    x = x + block.ffn(block.ln2(x))
                 else:
                     x, v_first = block(x, v_first)
         # ==================== End RunningWay Forward Pass ====================
@@ -803,6 +991,19 @@ class RunningWay(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         idx, targets = batch
         
+        # 如果启用了梯度调试，重置计数器并清空上次日志（便于定位本次 step）
+        if hasattr(self, "_grad_hook_counts"):
+            try:
+                self._reset_grad_debug_counters()
+                # 可选地清空日志文件，保留最新信息
+                logfile = "/tmp/rnw_grad_hook_log.txt"
+                try:
+                    open(logfile, "w").close()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         # ==================== RunningWay Training Setup ====================
         # For training, we typically don't want persistent state across batches
         # Reset state at the beginning of each training step
@@ -1019,3 +1220,162 @@ class RunningWay(pl.LightningModule):
         print(f"   - Load Model: {config.load_model}")
         print("=" * 60)
     # ==================== End RunningWay Inference Methods ====================
+
+    # ---------------- Diagnostics helpers ----------------
+    def _collect_param_map(self):
+        """
+        返回 dict: pid -> list of (name, shape, requires_grad)
+        """
+        param_map = {}
+        for name, p in self.named_parameters():
+            pid = id(p)
+            entry = (name, tuple(p.shape), bool(p.requires_grad))
+            param_map.setdefault(pid, []).append(entry)
+        return param_map
+
+    def _collect_statepool_param_ids(self):
+        """返回 state_pool 中所有参数的 id 列表（如果 state_pool 有 named_parameters）"""
+        ids = set()
+        try:
+            for n, p in self.state_pool.named_parameters():
+                ids.add(id(p))
+        except Exception:
+            pass
+        return ids
+
+    def _dump_param_debug_info(self, path="/tmp/rnw_param_debug.txt"):
+        """
+        导出详细的 param id->names 映射，标注同一 id 出现多次（共享/重复注册）。
+        也会标记哪些 param 来自 state_pool 以便对比。
+        """
+        param_map = self._collect_param_map()
+        statepool_ids = self._collect_statepool_param_ids()
+
+        lines = []
+        total = 0
+        shared_count = 0
+        for pid, entries in param_map.items():
+            total += len(entries)
+            is_state = pid in statepool_ids
+            if len(entries) > 1:
+                shared_count += 1
+            lines.append(f"PARAM_ID {pid}  state_pool_member={is_state}  occurrences={len(entries)}")
+            for name, shape, req in entries:
+                lines.append(f"    - name: {name}  shape: {shape}  requires_grad: {req}")
+
+        lines.append("")
+        lines.append(f"SUMMARY: total parameter registrations={total}, distinct_param_ids={len(param_map)}, shared_param_ids={shared_count}")
+        if statepool_ids:
+            lines.append(f"STATE_POOL_PARAM_IDS_COUNT: {len(statepool_ids)}")
+        # write to file and print small summary
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(lines))
+            print(f"[RunningWay] Param debug info written to {path}. Summary: distinct_ids={len(param_map)}, shared_ids={shared_count}")
+        except Exception as e:
+            print(f"[RunningWay] Failed to write param debug file {path}: {e}")
+        # also print top duplicated ones to stdout for quick check
+        for pid, entries in param_map.items():
+            if len(entries) > 1:
+                print(f"[RunningWay][DUP] id={pid} occurrences={len(entries)} names={[e[0] for e in entries][:5]}")
+
+    def _dump_optimizer_group_info(self, optimizer, path="/tmp/rnw_optimizer_param_groups.txt", param_map=None):
+        """
+        导出 optimizer.param_groups 的详细信息，便于定位重复归约的参数。
+        param_map: 可选 id -> [(name, shape, req), ...] 映射（若 None 则从模型收集）
+        """
+        try:
+            if param_map is None:
+                param_map = self._collect_param_map()
+
+            lines = []
+            all_ids = []
+            for gi, g in enumerate(getattr(optimizer, "param_groups", [])):
+                pg_params = g.get("params", [])
+                lines.append(f"GROUP {gi}  size={len(pg_params)}  options={{'lr':{g.get('lr')}, 'weight_decay':{g.get('weight_decay')}}}")
+                for pi, p in enumerate(pg_params):
+                    pid = id(p)
+                    all_ids.append(pid)
+                    names = param_map.get(pid, [])
+                    name_str = ", ".join([n for n,_,_ in names]) if names else "UNKNOWN"
+                    lines.append(f"    [{pi}] id={pid}  name(s)={name_str}  shape={tuple(getattr(p,'shape',()))}  requires_grad={getattr(p,'requires_grad',None)}")
+
+            # 重复 id 检查
+            from collections import Counter
+            counter = Counter(all_ids)
+            dup = [pid for pid, cnt in counter.items() if cnt > 1]
+            lines.append("")
+            lines.append(f"TOTAL_PARAMS_IN_GROUPS: {len(all_ids)}  DISTINCT_IDS: {len(set(all_ids))}  DUPLICATE_IDS_COUNT: {len(dup)}")
+            if dup:
+                lines.append("DUPLICATE_IDS:")
+                for pid in dup:
+                    names = param_map.get(pid, [])
+                    lines.append(f"   id={pid} occurrences_in_groups={counter[pid]}  names={[n for n,_,_ in names]}")
+
+            # 写入文件并打印简要信息
+            try:
+                with open(path, "w") as f:
+                    f.write("\n".join(lines))
+                print(f"[RunningWay] Optimizer groups dumped to {path}. duplicates={len(dup)}")
+            except Exception as wf:
+                print(f"[RunningWay] Failed to write optimizer dump to {path}: {wf}")
+
+            # 也将部分重复信息打印到 stdout 以便快速查看
+            if dup:
+                for pid in dup:
+                    names = param_map.get(pid, [])
+                    print(f"[RunningWay][OPT_DUP] id={pid} occurrences_in_groups={counter[pid]} names={[n for n,_,_ in names]}")
+        except Exception as e:
+            print(f"[RunningWay] Failed to dump optimizer groups: {e}")
+
+    def _enable_grad_debug_hooks(self, path="/tmp/rnw_grad_hook_log.txt"):
+        """
+        为模型中所有 requires_grad 的参数注册 hook，记录每次 backward 到达的次数。
+        若某个参数在一次 backward 中被调用超过一次，会把信息追加到 path 并打印。
+        为避免分布式重复归约失败（ZeRO/assertion），当检测到第二次及以上到达时
+        会返回一个全 0 的 grad（保留第一次真实梯度），以便训练可以继续并记录事件。
+        """
+        # 初始化计数映射
+        self._grad_hook_counts = {}
+        # 清空文件（给每次启用一个干净日志）
+        try:
+            open(path, "w").close()
+        except Exception:
+            pass
+
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            pid = id(p)
+            self._grad_hook_counts[pid] = 0
+
+            def make_hook(pid, name, logfile=path):
+                def hook(grad):
+                    # 增量计数（该 hook 在每次该参数的 grad 被计算时触发）
+                    cur = self._grad_hook_counts.get(pid, 0) + 1
+                    self._grad_hook_counts[pid] = cur
+
+                    if cur == 1:
+                        # 第一次出现：保留真实梯度
+                        return grad
+                    else:
+                        # 第二次及以后出现：记录并返回全 0 梯度以避免重复归约错误
+                        try:
+                            msg = f"DUP_GRAD pid={pid} name={name} count={cur}\n"
+                            with open(logfile, "a") as f:
+                                f.write(msg)
+                        except Exception:
+                            pass
+                        print(f"[RunningWay][GRAD_DUP] {name} pid={pid} count={cur} -> returning zero grad to avoid duplicate reduction")
+                        try:
+                            # 返回与原 grad 相同 device/ dtype 的零张量
+                            return torch.zeros_like(grad)
+                        except Exception:
+                            # 若不能构造（不常见），返回 grad 本身以不破坏流程
+                            return grad
+                return hook
+
+            try:
+                p.register_hook(make_hook(pid, name))
+            except Exception as e:
+                print(f"[RunningWay] Failed to register grad hook for {name}: {e}")

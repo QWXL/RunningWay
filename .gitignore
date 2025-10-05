@@ -218,3 +218,5 @@ nohup.out
 *.bin
 *.idx
 *.pth
+*.log
+train_log.txt

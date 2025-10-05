@@ -57,7 +57,6 @@ class train_callback(pl.Callback):
         for param_group in trainer.optimizers[0].param_groups:
             if param_group["weight_decay"] > 0:
                 param_group["weight_decay"] = wd_now
-            param_group["lr"] = lr * param_group["lr_scale"]
 
         trainer.my_lr = lr
         trainer.my_wd = wd_now
