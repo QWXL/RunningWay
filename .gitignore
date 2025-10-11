@@ -212,3 +212,6 @@ __marimo__/
 *.idx
 *.log
 datasets/*
+__pycache__/*
+
+json2binidx_tool/*
